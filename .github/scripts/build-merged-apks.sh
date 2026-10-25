@@ -27,7 +27,11 @@ if [[ "${BUILD_MODE:-changed}" == "changed" && -n "${BASE_SHA:-}" ]]; then
   fi
 fi
 
-mapfile -t gradlews < <(
+gradlews=()
+while IFS= read -r wrapper; do
+  [[ -n "$wrapper" ]] || continue
+  gradlews+=("$wrapper")
+done < <(
   find . \
     -type d \( -name .git -o -name build -o -name target \) -prune -o \
     -type f -name gradlew -print \
