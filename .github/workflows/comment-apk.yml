@@ -1,0 +1,36 @@
+# Posts the APK download link on the pull request after Build APK finishes.
+# This workflow is read from the default branch and does not check out
+# pull request code, so a forked pull request cannot change what it runs.
+name: Comment APK link
+
+on:
+  workflow_run:
+    workflows: ["Build APK"]
+    types: [completed]
+
+permissions:
+  actions: read
+  pull-requests: write
+
+jobs:
+  comment:
+    name: Comment the artifact link
+    if: >-
+      github.event.workflow_run.conclusion == 'success' ||
+      github.event.workflow_run.conclusion == 'failure'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the comment script from the default branch
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Comment on the pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WORKFLOW_EVENT: ${{ github.event.workflow_run.event }}
+          WORKFLOW_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          WORKFLOW_RUN_ID: ${{ github.event.workflow_run.id }}
+          HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+        run: bash .github/scripts/comment-apk.sh

@@ -1,11 +1,11 @@
-# Builds a debug APK after a pull request is merged into main.
-# Merging already requires write access. This does not compare the merger's
-# username with the org name "apalis-dev"; that check would never succeed.
-name: Build APK on merge
+# Builds a debug APK for Android projects changed by an open pull request.
+# A forked pull request cannot comment on itself, so comment-apk.yml posts
+# the artifact link after this workflow finishes.
+name: Build APK
 
 on:
   pull_request:
-    types: [closed]
+    types: [opened, synchronize, reopened]
   workflow_dispatch:
 
 permissions:
@@ -13,15 +13,36 @@ permissions:
 
 concurrency:
   group: build-apk-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
-  apk:
-    name: Assemble debug APKs
+  detect:
+    name: Find Android projects
     if: >-
       github.event_name == 'workflow_dispatch' ||
-      (github.event.pull_request.merged == true &&
-       github.event.pull_request.base.ref == 'main')
+      github.event.pull_request.base.ref == 'main'
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.detect.outputs.should_build }}
+    steps:
+      - name: Check out the pull request
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
+          fetch-depth: 0
+
+      - name: Detect affected Gradle projects
+        id: detect
+        env:
+          DETECT_ONLY: "1"
+          BUILD_MODE: ${{ github.event_name == 'workflow_dispatch' && 'all' || 'changed' }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: bash .github/scripts/build-merged-apks.sh
+
+  apk:
+    name: Assemble debug APKs
+    needs: detect
+    if: needs.detect.outputs.should_build == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 120
     env:
@@ -29,7 +50,7 @@ jobs:
       BUILD_MODE: ${{ github.event_name == 'workflow_dispatch' && 'all' || 'changed' }}
       BASE_SHA: ${{ github.event.pull_request.base.sha }}
     steps:
-      - name: Check out the merge commit
+      - name: Check out the pull request
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
@@ -83,7 +104,7 @@ jobs:
           echo "ANDROID_NDK_HOME=${ndk_home}" >> "$GITHUB_ENV"
           test -d "$ndk_home"
 
-      - name: Build APKs for projects changed by the merge
+      - name: Build APKs for projects changed by the pull request
         id: build
         run: bash .github/scripts/build-merged-apks.sh
 

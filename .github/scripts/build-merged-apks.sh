@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build a debug APK for each Android project affected by this merge.
+# Build a debug APK for each Android project affected by this pull request.
 # Submissions do not share one layout: some keep Gradle under android/ or
 # client/, and some compile Rust from scripts/build-android*.sh while others
 # expect `cargo ndk` before Gradle.
@@ -10,12 +10,14 @@ cd "$repo_root"
 
 apk_count=0
 failures=0
+should_build=false
 dist="$repo_root/dist/apks"
 mkdir -p "$dist"
 
 on_exit() {
   if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
     echo "apk_count=$apk_count" >> "$GITHUB_OUTPUT"
+    echo "should_build=$should_build" >> "$GITHUB_OUTPUT"
   fi
 }
 trap on_exit EXIT
@@ -117,7 +119,10 @@ build_native() {
   return 1
 }
 
-for wrapper in "${gradlews[@]}"; do
+# Sets gradle_dir, submission_root, and label for a wrapper path.
+locate_project() {
+  local wrapper="$1"
+  local gradle_base
   gradle_dir="$repo_root/$(dirname "$wrapper")"
   gradle_base=$(basename "$gradle_dir")
   if [[ "$gradle_base" == "android" || "$gradle_base" == "client" ]]; then
@@ -125,17 +130,37 @@ for wrapper in "${gradlews[@]}"; do
   else
     submission_root="$gradle_dir"
   fi
-
   if [[ "$submission_root" == "$repo_root" ]]; then
     label="root"
   else
     label="${submission_root#"$repo_root"/}"
   fi
+}
 
-  if ! project_changed "$submission_root"; then
-    echo "Skipping $label (unchanged in this merge)."
-    continue
+affected=()
+for wrapper in "${gradlews[@]}"; do
+  locate_project "$wrapper"
+  if project_changed "$submission_root"; then
+    echo "Affected: $label"
+    affected+=("$wrapper")
+    should_build=true
+  else
+    echo "Skipping $label (unchanged in this pull request)."
   fi
+done
+
+if [[ "${DETECT_ONLY:-0}" == "1" ]]; then
+  echo "Detect only. should_build=$should_build"
+  exit 0
+fi
+
+if [[ ${#affected[@]} -eq 0 ]]; then
+  echo "No Android project to build."
+  exit 0
+fi
+
+for wrapper in "${affected[@]}"; do
+  locate_project "$wrapper"
 
   echo "::group::Build $label"
   native_built=0
