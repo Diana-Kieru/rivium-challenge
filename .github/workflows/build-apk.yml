@@ -1,0 +1,97 @@
+# Builds a debug APK after a pull request is merged into main.
+# Merging already requires write access. This does not compare the merger's
+# username with the org name "apalis-dev"; that check would never succeed.
+name: Build APK on merge
+
+on:
+  pull_request:
+    types: [closed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-apk-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  apk:
+    name: Assemble debug APKs
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.pull_request.merged == true &&
+       github.event.pull_request.base.ref == 'main')
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      CARGO_BUILD_JOBS: "2"
+      BUILD_MODE: ${{ github.event_name == 'workflow_dispatch' && 'all' || 'changed' }}
+      BASE_SHA: ${{ github.event.pull_request.base.sha }}
+    steps:
+      - name: Check out the merge commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
+          fetch-depth: 0
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,x86_64-linux-android
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-all-crates: true
+
+      - name: Cache cargo-ndk
+        id: cargo-ndk-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-ndk
+          key: cargo-ndk-4.1.2-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Install cargo-ndk
+        if: steps.cargo-ndk-cache.outputs.cache-hit != 'true'
+        run: cargo install cargo-ndk --version 4.1.2 --locked
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+          log-accepted-android-sdk-licenses: false
+
+      - name: Install SDK platforms and NDK
+        run: |
+          set -euo pipefail
+          sdkmanager --install \
+            "platforms;android-35" \
+            "platforms;android-36" \
+            "build-tools;35.0.0" \
+            "build-tools;36.0.0" \
+            "ndk;27.2.12479018"
+          sdkmanager --install "platforms;android-37" || echo "platforms;android-37 is not in this SDK list yet"
+          ndk_home="${ANDROID_SDK_ROOT}/ndk/27.2.12479018"
+          echo "ANDROID_HOME=${ANDROID_SDK_ROOT}" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=${ndk_home}" >> "$GITHUB_ENV"
+          test -d "$ndk_home"
+
+      - name: Build APKs for projects changed by the merge
+        id: build
+        run: bash .github/scripts/build-merged-apks.sh
+
+      - name: Upload APKs
+        if: always() && steps.build.outputs.apk_count != '' && steps.build.outputs.apk_count != '0'
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-pr-${{ github.event.pull_request.number || github.run_number }}
+          path: dist/apks/*.apk
+          if-no-files-found: error
+          retention-days: 14
