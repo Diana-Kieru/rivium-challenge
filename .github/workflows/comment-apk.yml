@@ -1,6 +1,7 @@
-# Posts the APK download link on the pull request after Build APK finishes.
-# This workflow is read from the default branch and does not check out
-# pull request code, so a forked pull request cannot change what it runs.
+# After Build APK finishes, commit app-name/debug.apk onto a review branch
+# in this repository and comment the download link on the pull request.
+# Runs from the default branch so forked pull requests cannot change it,
+# and so the job has permission to push and comment.
 name: Comment APK link
 
 on:
@@ -10,14 +11,16 @@ on:
 
 permissions:
   actions: read
+  contents: write
   pull-requests: write
 
 jobs:
   comment:
-    name: Comment the artifact link
+    name: Commit APK and comment
     if: >-
-      github.event.workflow_run.conclusion == 'success' ||
-      github.event.workflow_run.conclusion == 'failure'
+      github.event.workflow_run.event == 'pull_request' &&
+      (github.event.workflow_run.conclusion == 'success' ||
+       github.event.workflow_run.conclusion == 'failure')
     runs-on: ubuntu-latest
     steps:
       - name: Check out the comment script from the default branch
@@ -25,12 +28,12 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Comment on the pull request
+      - name: Commit APK and comment on the pull request
         env:
           GH_TOKEN: ${{ github.token }}
-          WORKFLOW_EVENT: ${{ github.event.workflow_run.event }}
           WORKFLOW_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
           WORKFLOW_RUN_ID: ${{ github.event.workflow_run.id }}
           HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
           HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
         run: bash .github/scripts/comment-apk.sh

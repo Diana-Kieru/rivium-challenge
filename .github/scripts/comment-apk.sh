@@ -1,25 +1,21 @@
 #!/usr/bin/env bash
-# Post or update a pull request comment with the debug APK artifact link.
-# Runs from comment-apk.yml after Build APK finishes. Fork pull requests
-# cannot comment during the build job, so this runs in the base repository.
+# Download the built debug APK, commit it to branch apk/pr-<n> in this
+# repository at app-name/debug.apk, and comment the file link on the PR.
+# A separate branch avoids pushing to the PR head (which would re-trigger
+# the build) and works for forked pull requests.
 set -euo pipefail
 
 : "${GITHUB_REPOSITORY:?}"
-: "${WORKFLOW_EVENT:?}"
 : "${WORKFLOW_CONCLUSION:?}"
 : "${WORKFLOW_RUN_ID:?}"
 : "${HEAD_REPO:?}"
 : "${HEAD_BRANCH:?}"
+: "${GH_TOKEN:?}"
 
-if [[ "$WORKFLOW_EVENT" != "pull_request" ]]; then
-  echo "Event is $WORKFLOW_EVENT. No pull request to comment on."
-  exit 0
-fi
-
-if [[ "$WORKFLOW_CONCLUSION" != "success" && "$WORKFLOW_CONCLUSION" != "failure" ]]; then
-  echo "Conclusion is $WORKFLOW_CONCLUSION. Not commenting."
-  exit 0
-fi
+marker="<!-- apk-artifact -->"
+run_url="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${WORKFLOW_RUN_ID}"
+head_sha_short="${HEAD_SHA:-unknown}"
+head_sha_short="${head_sha_short:0:7}"
 
 owner="${HEAD_REPO%%/*}"
 pr_number=$(
@@ -31,54 +27,120 @@ if [[ -z "$pr_number" ]]; then
   exit 0
 fi
 
-run_url="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${WORKFLOW_RUN_ID}"
-artifact_id=$(
-  gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${WORKFLOW_RUN_ID}/artifacts" \
-    --jq ".artifacts[] | select(.name==\"apk-pr-${pr_number}\") | .id" \
-    | head -n 1
-)
-marker="<!-- apk-artifact -->"
-
-if [[ -n "$artifact_id" ]]; then
-  artifact_url="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${WORKFLOW_RUN_ID}/artifacts/${artifact_id}"
-  body=$(cat <<EOF
-${marker}
-Debug APK is ready: ${artifact_url}
-
-The download is a zip of the debug APKs from [run ${WORKFLOW_RUN_ID}](${run_url}). It is kept for 14 days.
-EOF
-)
-  if [[ "$WORKFLOW_CONCLUSION" != "success" ]]; then
-    body="${body}
-
-The workflow run did not fully succeed, so some projects in that zip may be missing."
+comment_and_exit() {
+  local body="$1"
+  if [[ "${DRY_RUN:-0}" == "1" ]]; then
+    echo "Would comment on #${pr_number}:"
+    printf '%s\n' "$body"
+    exit 0
   fi
-elif [[ "$WORKFLOW_CONCLUSION" == "failure" ]]; then
-  body=$(cat <<EOF
+  local existing
+  existing=$(
+    gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${pr_number}/comments" \
+      --jq ".[] | select(.body | contains(\"${marker}\")) | .id" \
+      | head -n 1
+  )
+  if [[ -n "$existing" ]]; then
+    gh api --method PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${existing}" \
+      -f body="$body" >/dev/null
+    echo "Updated comment ${existing} on #${pr_number}."
+  else
+    gh api --method POST "repos/${GITHUB_REPOSITORY}/issues/${pr_number}/comments" \
+      -f body="$body" >/dev/null
+    echo "Commented on #${pr_number}."
+  fi
+  exit 0
+}
+
+if [[ "$WORKFLOW_CONCLUSION" != "success" ]]; then
+  comment_and_exit "$(cat <<EOF
 ${marker}
 The APK build failed. Log: ${run_url}
 EOF
-)
-else
-  echo "No APK artifact for pull request #${pr_number}. Not commenting."
-  exit 0
+)"
 fi
 
-if [[ "${DRY_RUN:-0}" == "1" ]]; then
-  echo "Would comment on #${pr_number}:"
-  printf '%s\n' "$body"
-  exit 0
+tmpdir=$(mktemp -d)
+work=""
+cleanup() {
+  rm -rf "$tmpdir"
+  [[ -n "$work" ]] && rm -rf "$work"
+}
+trap cleanup EXIT
+
+if ! gh run download "$WORKFLOW_RUN_ID" \
+  --repo "$GITHUB_REPOSITORY" \
+  --name debug-apk \
+  --dir "$tmpdir"; then
+  comment_and_exit "$(cat <<EOF
+${marker}
+The APK build finished without a debug-apk artifact. Log: ${run_url}
+EOF
+)"
 fi
 
-existing=$(
-  gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${pr_number}/comments" \
-    --jq ".[] | select(.body | contains(\"${marker}\")) | .id" \
-    | head -n 1
-)
-if [[ -n "$existing" ]]; then
-  gh api --method PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${existing}" -f body="$body" >/dev/null
-  echo "Updated comment ${existing} on #${pr_number}."
-else
-  gh api --method POST "repos/${GITHUB_REPOSITORY}/issues/${pr_number}/comments" -f body="$body" >/dev/null
-  echo "Commented on #${pr_number}."
+meta=$(find "$tmpdir" -name apk-meta.env -type f | head -n 1 || true)
+if [[ -z "$meta" ]]; then
+  comment_and_exit "$(cat <<EOF
+${marker}
+The APK artifact was missing metadata. Log: ${run_url}
+EOF
+)"
 fi
+
+# shellcheck disable=SC1090
+source "$meta"
+: "${APP_NAME:?apk-meta.env must set APP_NAME}"
+
+apk=$(find "$tmpdir" -type f -name 'debug.apk' | head -n 1 || true)
+if [[ -z "$apk" || ! -s "$apk" ]]; then
+  comment_and_exit "$(cat <<EOF
+${marker}
+The APK artifact did not contain debug.apk. Log: ${run_url}
+EOF
+)"
+fi
+
+review_branch="apk/pr-${pr_number}"
+work=$(mktemp -d)
+
+git clone --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "$work"
+cd "$work"
+
+git config user.name "github-actions[bot]"
+git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+if git ls-remote --exit-code --heads origin "$review_branch" >/dev/null 2>&1; then
+  git fetch --depth 1 origin "$review_branch"
+  git checkout -B "$review_branch" FETCH_HEAD
+else
+  git checkout --orphan "$review_branch"
+  git rm -rf . >/dev/null 2>&1 || true
+fi
+
+mkdir -p "$APP_NAME"
+cp "$apk" "$APP_NAME/debug.apk"
+git add -f "$APP_NAME/debug.apk"
+
+if git diff --cached --quiet; then
+  echo "APK unchanged on ${review_branch}."
+  commit_sha=$(git rev-parse HEAD)
+else
+  git commit -m "Add ${APP_NAME}/debug.apk for pull request #${pr_number}"
+  git push -u origin "HEAD:${review_branch}" --force
+  commit_sha=$(git rev-parse HEAD)
+fi
+
+apk_url="https://github.com/${GITHUB_REPOSITORY}/raw/${commit_sha}/${APP_NAME}/debug.apk"
+blob_url="https://github.com/${GITHUB_REPOSITORY}/blob/${commit_sha}/${APP_NAME}/debug.apk"
+
+comment_and_exit "$(cat <<EOF
+${marker}
+Debug APK is ready for \`${APP_NAME}\`:
+
+- Download: ${apk_url}
+- In repo: ${blob_url}
+
+Built from [\`${HEAD_BRANCH}\`](${run_url}) (\`${head_sha_short}\`).
+EOF
+)"
